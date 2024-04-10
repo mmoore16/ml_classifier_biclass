@@ -1,0 +1,528 @@
+---
+title: "Brain, Outcome, and Covariate Elastic Net Analyses - Classifier"
+author: "Matthew Moore"
+output: 
+  html_document:
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+These are elastic net analyses for brain variables, binary class outcome (e.g., condition absent vs. condition present), and covariates.
+
+```{r init, message=FALSE, warning=FALSE, include=FALSE}
+library('knitr')
+library('caret')
+library('glmnet')
+library('MLmetrics')
+library('pROC')
+
+```
+
+#Load in brain, outcome, and covariate data sets.
+```{r}
+#set location
+datapath1 <- '//path/to/data/file/'
+
+#read in data
+bcov0 <- read.csv(paste0(datapath1,"data.csv"),header=TRUE,na.strings=c(""," ","NA","-999","999"))
+
+bcov0 <- bcov0[(bcov0$SITE==1),] #keep only site of interest
+row.names(bcov0) <- NULL
+
+```
+
+#Set up brain, outcome, and covariate data sets. Set helpful functions.
+```{r}
+#helpful functions
+#function for selecting complete data cases
+completeFun <- function(data, desiredCols) {
+  completeVec <- complete.cases(data[, desiredCols])
+  return(data[completeVec, ])
+}
+
+#function for obtaining best results from caret analysis
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+
+#extract variables of interest for analysis
+bcov <- bcov0[,c(1,11,2,4:8,9,10,12,14,18:471)] #move outcome to column 2
+
+###########################
+#filter cases, reorder cases, center and scale variables
+bcov <- completeFun(bcov,c(1,2:466)) #removing cases with missing data
+row.names(bcov) <- NULL
+
+bcov <- bcov[order(bcov[,2], bcov[,1]), ] #reorder data by outcome and participant id
+row.names(bcov) <- NULL
+
+bcov[c(3,5,8)] <- lapply(bcov[c(3,5,8)], function(x) c(scale(x, center = TRUE, scale = TRUE))) #center and scale variables (e.g., age, years of education, total intracranial volume)
+row.names(bcov) <- NULL
+
+###########################
+
+#define data columns - variables of interest for analysis
+cov <- bcov[,c(2:11)] #covariates
+gmv <- as.matrix(t(bcov[,c(13:174)])) #gray matter volume columns
+th <- as.matrix(t(bcov[,c(175:242)])) #cortical thickness columns
+fa <- as.matrix(t(bcov[,c(243:298)])) #fractional anisotropy columns
+md <- as.matrix(t(bcov[,c(299:354)])) #mean diffusivity columns
+rd <- as.matrix(t(bcov[,c(355:410)])) #radial diffusivity columns
+ad <- as.matrix(t(bcov[,c(411:466)])) #axial diffusivity columns
+
+#######################################
+
+#neurocombat adjustment for site
+#if harmonization across sites needed, code here
+####
+
+#gmv
+bcov_gmv <- data.frame(t(gmv))
+row.names(bcov_gmv) <- NULL
+
+#th
+bcov_th <- data.frame(t(th))
+row.names(bcov_th) <- NULL
+
+#fa
+bcov_fa <- data.frame(t(fa))
+row.names(bcov_fa) <- NULL
+
+#md
+bcov_md <- data.frame(t(md))
+row.names(bcov_md) <- NULL
+
+#rd
+bcov_rd <- data.frame(t(rd))
+row.names(bcov_rd) <- NULL
+
+#ad
+bcov_ad <- data.frame(t(ad))
+row.names(bcov_ad) <- NULL
+
+#######################################
+
+#set up outcome variable
+rnd_perms <- subset(bcov, select = c(condition_group)) #select outcome variable
+rnd_perms$group <- factor(rnd_perms$condition_group, labels = c("group0", "group1")) #assign labels for compatibility with caret
+rnd_perms <- subset(rnd_perms, select = c(group)) #select relevant column
+
+#set seed for reproducibility
+set.seed(2143)
+
+#create permutations of outcome variable for statistical significance testing (e.g., 100, 1000)
+for(prm in 2:101){
+  rnd_perms[,prm] <- sample(rnd_perms$group)
+}
+colnames(rnd_perms) <- paste0("group_p",0:100) #copy column name and label permutation number
+write.csv(rnd_perms,paste0(datapath1,"rnd_perms_group.csv"),row.names = FALSE)
+
+#set seed for reproducibility
+set.seed(2143)
+
+#create set of random seeds for repeats (e.g., 10, 20, 50, 100)
+rnd_seeds <- data.frame(sample(9999, size = 50, replace = FALSE)) #generate set of random 4 digit seeds
+write.csv(rnd_seeds,paste0(datapath1,"rnd_seeds_group.csv"),row.names = FALSE)
+
+#create list of feature sets and feature set names
+feat_sets = list(bcov_gmv,bcov_th,bcov_fa,bcov_md,bcov_rd,bcov_ad)
+feat_set_names <- c("gmv","th","fa","md","rd","ad")
+
+#condition labels
+cond_lbl <- c("group0", "group1")
+
+#cov columns
+cov_clmns <- c(1:9) #columns corresponding to covariates
+
+#feat columns
+feat_clmns = list(c(163:325),c(69:137),c(57:113),c(57:113),c(57:113),c(57:113)) #columns corresponding to rois
+
+#identify samples
+sample_names <- c("cohort1","allcohorts")
+
+#create dataframe for model fitting summary metrics
+mod_fit_perf <- data.frame(matrix(0, nrow = 1, ncol = 6))
+colnames(mod_fit_perf) <- c("AUC","Sensitivity","Specificity","Accuracy","Precision","Recall")
+
+#create dataframe for final model fitting summary metrics
+mod_fit_perf_final <- mod_fit_perf
+
+```
+
+#Elastic net analyses - classification with one feature set - caret
+```{r, message=FALSE, warning=FALSE}
+rm(list=setdiff(ls(), c("bcov_gmv","bcov_th","bcov_fa","bcov_md","bcov_rd","bcov_ad","bcov","cov","completeFun","get_best_result","datapath1","rnd_perms","rnd_seeds","feat_sets","cond_lbl","cov_clmns","feat_clmns","feat_set_names","sample_names","mod_fit_perf","mod_fit_perf_final")))
+
+for(perm in 1:ncol(rnd_perms)){#real + X permutation tests
+  rm(list=setdiff(ls(), c("bcov_gmv","bcov_th","bcov_fa","bcov_md","bcov_rd","bcov_ad","bcov","cov","completeFun","get_best_result","datapath1","rnd_perms","rnd_seeds","feat_sets","cond_lbl","cov_clmns","feat_clmns","feat_set_names","sample_names","mod_fit_perf","mod_fit_perf_final","perm")))
+  
+  for(rsd in 1:nrow(rnd_seeds)){#X seeds
+    rm(list=setdiff(ls(), c("bcov_gmv","bcov_th","bcov_fa","bcov_md","bcov_rd","bcov_ad","bcov","cov","completeFun","get_best_result","datapath1","rnd_perms","rnd_seeds","feat_sets","cond_lbl","cov_clmns","feat_clmns","feat_set_names","sample_names","mod_fit_perf","mod_fit_perf_final","perm","rsd")))
+    
+    for(feat in 1:length(feat_sets)){#X feature sets
+      rm(list=setdiff(ls(), c("bcov_gmv","bcov_th","bcov_fa","bcov_md","bcov_rd","bcov_ad","bcov","cov","completeFun","get_best_result","datapath1","rnd_perms","rnd_seeds","feat_sets","cond_lbl","cov_clmns","feat_clmns","feat_set_names","sample_names","mod_fit_perf","mod_fit_perf_final","perm","rsd","feat")))
+      
+      #identify sample names
+      samp <- sample_names[1] #only examining first sample!
+      
+      #identify feature set
+      bcov_feat <- feat_sets[[feat]] #identify feature set
+      
+      #relabel outcome for combatibility with caret
+      bcov_feat$cond <- subset(rnd_perms, select = c(perm)) #assign cond labels from permutations
+      bcov_feat <- as.data.frame(lapply(bcov_feat, unlist)) #convert to data frame and unlist to be in expected format
+      
+      #append covariates for covariate adjustment steps
+      bcov_feat_cov <- cbind(subset(cov, select = c(2:length(cov))), bcov_feat) #all cov (ignoring cond of interest) and feature set
+      
+      #set seed for reproducibility
+      set.seed(as.numeric(rnd_seeds[rsd,1]))
+      
+      #define folds and cross-validation settings
+      outerfolds <- createFolds(bcov_feat$cond, k = 5, list = FALSE, returnTrain = FALSE)
+      cv_train = trainControl(method = "cv", number = 5, classProbs = TRUE, verboseIter = FALSE, summaryFunction = twoClassSummary, sampling = "up", savePredictions = "final")
+      
+      #collect the predict outcome obtained from CV
+      cond_predicted = matrix(0, nrow = nrow(bcov_feat), ncol = 1)
+      cond_predicted_raw = matrix(0, nrow = nrow(bcov_feat), ncol = 1)
+      tg <- expand.grid(lambda = exp(seq(log(2e-3), log(1e0), length.out = 50)),
+                  alpha = seq(0, 1, 0.02))
+      
+      #iterate over folds (e.g., 1-5)
+      for(i in 1:5){
+        bcov_feat_idx = which(outerfolds == i) #select cases that are in current fold
+        bcov_feat_trn = bcov_feat[-bcov_feat_idx,] #assign data outside present fold to training data
+        bcov_feat_tst = bcov_feat[bcov_feat_idx,] #assign data within present fold to testing data
+        bcov_feat_cov_trn = bcov_feat_cov[-bcov_feat_idx,] #data version with covariates - used for covariate adjustment
+        bcov_feat_cov_tst = bcov_feat_cov[bcov_feat_idx,] #data version with covariates - used for covariate adjustment
+        
+        #make copies of training and testing data to maintain relevant indices/rows
+        bcov_feat_trn_fit <- bcov_feat_trn #copy data frame for fitted value process
+        bcov_feat_tst_fit <- bcov_feat_tst #copy data frame for fitted value process
+        
+        #confound adjustment within folds using linear regression fitting
+        for(j in 1:length(bcov_feat_trn)){
+          x_temp2 <- bcov_feat_cov_trn[,cov_clmns] #select covariates from training data
+          y_temp2 <- subset(bcov_feat_trn, select = c(j)) #select outcome
+          
+          #fit covariate regression model
+          var_xs <- colnames(x_temp2) #select covariates based on column names
+          mod_y1_fit <- lm(as.formula(paste(y_temp2,"~",paste(var_xs, collapse="+"))),na.action=na.exclude,data=bcov_feat_cov_trn) #run regression with x vars and y
+          
+          #apply model to training data
+          y1_trn_fit <- predict(mod_y1_fit,x_temp2) #use model to fit train data
+          y1_trn_fit <- as.data.frame(y1_trn_fit) #convert fitted variable to data frame
+          colnames(y1_trn_fit) <- paste(colnames(y_temp2),"fit",sep="_") #copy column name and label fitted
+          bcov_feat_trn_fit <- cbind(bcov_feat_trn_fit,y1_trn_fit) #combine fitted y values from each predicted variable
+          
+          #apply model to testing data
+          x_temp3 <- bcov_feat_cov_tst[,cov_clmns] #select covariates from testing data
+          y1_tst_fit <- predict(mod_y1_fit,x_temp3) #use model to fit test data
+          y1_tst_fit <- as.data.frame(y1_tst_fit) #convert fitted variable to data frame
+          colnames(y1_tst_fit) <- paste(colnames(y_temp2),"fit",sep="_") #copy column name and label fitted (note using the training label!)
+          bcov_feat_tst_fit <- cbind(bcov_feat_tst_fit,y1_tst_fit) #combine fitted y values from each predicted variable
+        }
+        
+        #select relevant columns for analysis of outcome and fitted predictor values
+        bcov_feat_trn_fit <- subset(bcov_feat_trn_fit, select = feat_clmns[[feat]]) #keep only outcome and fitted values
+        bcov_feat_tst_fit <- subset(bcov_feat_tst_fit, select = feat_clmns[[feat]]) #keep only outcome and fitted values
+        
+        #make copies of training and testing data to maintain relevant indices/rows
+        bcov_feat_trn_filt <- data.frame(1) #designate data frame with first column being 1 for the outcome (make sure outcome is in this location)
+        colnames(bcov_feat_trn_filt) <- "cond" #copy column name and label fitted (note using the training label!)
+        bcov_feat_tst_filt <- data.frame(1) #designate data frame with first column being 1 for the outcome (make sure outcome is in this location)
+        colnames(bcov_feat_tst_filt) <- "cond" #copy column name and label fitted (note using the training label!)
+        
+        #compute data filtering criteria (e.g., t-test)
+        for(k in 2:length(bcov_feat_trn_fit)){
+          x_temp4 <- subset(bcov_feat_trn_fit, select = c(k)) #select outcome
+          y_temp4 <- subset(bcov_feat_trn_fit, select = c(cond)) #select outcome
+          xy_temp4 <- cbind(x_temp4,y_temp4) #bind relevant variables
+          
+          #test association with outcome for filtering
+          ttest1_temp <- t.test(xy_temp4[,1] ~ xy_temp4[,2], data = xy_temp4, paired = FALSE, var.equal = FALSE) #compute t-test between outcome groups for predictor
+          x1_trn_filt <- ifelse(ttest1_temp$p.value < .05, 1, 0) #if t-test p value < .05 indicate 1 for keep, 0 for drop
+          
+          #create row of filter indicators for training data
+          x1_trn_filt <- as.data.frame(x1_trn_filt) #convert filtered variable to data frame
+          colnames(x1_trn_filt) <- paste(colnames(x_temp4)) #copy column name and label filt
+          bcov_feat_trn_filt <- cbind(bcov_feat_trn_filt,x1_trn_filt) #combine filtered x values
+          
+          #create row of filter indicators for testing data
+          x_temp5 <- subset(bcov_feat_tst_fit, select = c(k)) #select data
+          x1_tst_filt <- as.data.frame(x1_trn_filt) #convert filtered variable to data frame
+          colnames(x1_tst_filt) <- paste(colnames(x_temp5)) #copy column name and label filt
+          bcov_feat_tst_filt <- cbind(bcov_feat_tst_filt,x1_tst_filt) #combine filtered x values
+        } 
+        
+        #select relevant columns for analysis of outcome and filtered predictor values 
+        #bcov_feat_trn_fit <- bcov_feat_trn_fit[,colSums(bcov_feat_trn_filt) == 1] #drop columns that are not 1/above filter threshold
+        #bcov_feat_tst_fit <- bcov_feat_tst_fit[,colSums(bcov_feat_tst_filt) == 1] #drop columns that are not 1/above filter threshold
+        
+        #rescale fitted values within folds before training models
+        preProcValues <- preProcess(bcov_feat_trn_fit, method = c("center", "scale")) #calculate centering and scaling values for training data
+        bcov_feat_trn_adj <- predict(preProcValues, bcov_feat_trn_fit) #apply centering and scaling adjustment calculated from training data to training data
+        bcov_feat_tst_adj <- predict(preProcValues, bcov_feat_tst_fit) #apply centering and scaling adjustment calculated from training data to testing data
+        
+        #set seed for reproducibility
+        set.seed(as.numeric(rnd_seeds[rsd,1]))
+        
+        #train elastic net
+        def_elenet = train(
+          cond ~., 
+          data = bcov_feat_trn_adj,
+          method = "glmnet",
+          metric = "ROC",
+          tuneLength = 25,
+          verbose = FALSE,
+          trControl = cv_train,
+          tuneGrid = tg
+          )
+        
+        #collect the predicted score based on trained elastic net
+        cond_predicted[which(outerfolds == i)]=predict(def_elenet,newdata=bcov_feat_tst_adj,type = "prob")[,1]
+        cond_predicted_raw[which(outerfolds == i)]=predict(def_elenet,newdata=bcov_feat_tst_adj,type = "raw")
+
+        #extract fit metrics
+        if(i==1){#for first instance copy with column names
+          cond_bestfits <- get_best_result(def_elenet)
+        }
+        if(i > 1){#for all other instances copy to new row
+          cond_bestfits[i,] <- get_best_result(def_elenet)
+        }
+        if(i==1){#for first instance copy with column names
+          cond_coefs <- as.data.frame(as.matrix(coef(def_elenet$finalModel, s = def_elenet$bestTune$lambda)))
+        }
+        if(i > 1){#for all other instances copy to new column
+          cond_coefs <- cbind(cond_coefs,(as.data.frame(as.matrix(coef(def_elenet$finalModel, s = def_elenet$bestTune$lambda)))))
+        }
+        if(i==1){#for first instance copy with column names
+          temp_varimp <- varImp(def_elenet, lambda = def_elenet$bestTune$lambda, useModel = FALSE, nonpara = TRUE, scale = TRUE)
+          cond_varimp <- as.data.frame(temp_varimp$importance[,1])
+        }
+        if(i > 1){#for all other instances copy to new column
+          temp_varimp <- varImp(def_elenet, lambda = def_elenet$bestTune$lambda, useModel = FALSE, nonpara = TRUE, scale = TRUE)
+          cond_varimp <- cbind(cond_varimp,temp_varimp$importance[,1])
+        }
+
+        #save model
+        saveRDS(def_elenet,paste0(datapath1,"model_",toString(colnames(rnd_perms)[perm]),"_s",toString(as.numeric(rnd_seeds[rsd,1])),"_",toString(feat_set_names[feat]),"_",toString(samp),"_fold",toString(i),".rds"))
+      }
+      
+      #cond label
+      cond_label = bcov_feat$cond
+      
+      #predicted classification combined from outer folds
+      cond_predicted_raw <- as.data.frame(cond_predicted_raw)
+      cond_predicted_raw$cond <- as.factor(cond_predicted_raw$V1)
+      cond_predicted_raw$cond <- factor(cond_predicted_raw$cond, labels = cond_lbl) #assign labels for compatibility with caret
+      
+      #confusion matrix and statistics combined from outer folds
+      cat('\n Confusion matrix and stats combined from outer folds for outcome', toString(colnames(rnd_perms)[perm]), 'with seed', toString(as.numeric(rnd_seeds[rsd,1])),'and feature', toString(feat_set_names[feat]), 'in sample', toString(samp), '\n')
+      print(confusionMatrix(cond_predicted_raw$cond, bcov_feat$cond))
+      
+      #plot ROC curve and calculate AUC for elastic net
+      roc_object <- roc(as.vector(cond_label) ~ as.vector(cond_predicted), plot = TRUE, print.auc = TRUE, legacy.axes = TRUE, col = "blue3", main = "ROC curve")
+      
+      #feature coefficients
+      print(cond_coefs) #print coefficients from the outer folds
+      cond_coefs_sums <- as.data.frame(rowSums(cond_coefs != 0)) #how many times did features contribute non-zero to outer folds of model fitting
+      print(cond_coefs_sums) #how many times did features contribute non-zero to outer folds of model fitting
+      
+      #feature importance across outer folds
+      rownames(cond_varimp) <- rownames(cond_coefs[-1,]) #copy variable names from coefs to varimp (excluding intercept)
+      print(cond_varimp) #print feature importance from the outer folds
+      cond_varimp_means <- as.data.frame(rowMeans(cond_varimp)) #mean importance of features across outer folds of model fitting
+      print(cond_varimp_means) #mean importance of features across outer folds of model fitting
+      
+      #model fit metrics across outer folds
+      print(cond_bestfits) #print model fit metrics across outer folds
+      cond_bestfits_means <- as.data.frame(colMeans(cond_bestfits)) #mean model fit metrics across outer folds
+      print(cond_bestfits_means) #mean model fit metrics across outer folds
+      
+      #save observed, predicted, and predicted raw values
+      cond_obs_pred <- cbind(subset(bcov, select=c(1:2)), cond_predicted, cond_predicted_raw)
+      write.csv(cond_obs_pred,paste0(datapath1,"obs_pred_",toString(colnames(rnd_perms)[perm]),"_s",toString(as.numeric(rnd_seeds[rsd,1])),"_",toString(feat_set_names[feat]),"_",toString(samp),".csv"),row.names = FALSE)
+      
+      #calcuate and save model performance metrics
+      temp_auc <- auc(as.vector(cond_label) ~ as.vector(cond_predicted))
+      temp_sns <- sensitivity(cond_predicted_raw$cond,cond_label)
+      temp_spf <- specificity(cond_predicted_raw$cond,cond_label)
+      temp_acc <- Accuracy(as.vector(cond_predicted_raw$cond),as.vector(cond_label))
+      temp_prc <- precision(cond_predicted_raw$cond,cond_label)
+      temp_rec <- recall(cond_predicted_raw$cond,cond_label)
+      
+      mod_fit_perf[1,] <- c(temp_auc,temp_sns,temp_spf,temp_acc,temp_prc,temp_rec)
+      
+      write.csv(mod_fit_perf,paste0(datapath1,"mod_fit_perf_",toString(colnames(rnd_perms)[perm]),"_s",toString(as.numeric(rnd_seeds[rsd,1])),"_",toString(feat_set_names[feat]),"_",toString(samp),".csv"),row.names = FALSE)
+      
+      ##############################################################
+      #"final" model fitting (outer folds only, not nested)
+      
+      #set seed for reproducibility
+      set.seed(as.numeric(rnd_seeds[rsd,1]))
+      
+      #define folds and cross-validation settings
+      outerfolds_final <- createFolds(bcov_feat$cond, k = 5, list = TRUE, returnTrain = TRUE)
+      cv_train_final = trainControl(method = "cv", classProbs = TRUE, verboseIter = FALSE, summaryFunction = twoClassSummary, sampling = "up", savePredictions = "final", index = outerfolds_final)
+      
+      #collect the predict score obtained from CV
+      cond_predicted_final = matrix(0, nrow = nrow(bcov_feat), ncol = 1)
+      cond_predicted_raw_final = matrix(0, nrow = nrow(bcov_feat), ncol = 1)
+      
+      bcov_feat_trn_final = bcov_feat #assign all data to training data
+      bcov_feat_tst_final = bcov_feat #assign all data to testing data
+      bcov_feat_cov_trn_final = bcov_feat_cov #data version with covariates - used for covariate adjustment
+      bcov_feat_cov_tst_final = bcov_feat_cov #data version with covariates - used for covariate adjustment
+      
+      #make copies of training and testing data to maintain relevant indices/rows
+      bcov_feat_trn_fit_final <- bcov_feat #copy data frame for fitted value process
+      bcov_feat_tst_fit_final <- bcov_feat #copy data frame for fitted value process
+      
+      #confound adjustment using linear regression fitting
+      for(jj in 1:length(bcov_feat_trn_final)){
+        x_temp2_final <- bcov_feat_cov_trn_final[,cov_clmns] #select covariates from data
+        y_temp2_final <- subset(bcov_feat_trn_final, select = c(jj)) #select outcome
+        
+        #fit covariate regression model
+        var_xs_final <- colnames(x_temp2_final) #select covariates based on column names
+        mod_y1_fit_final <- lm(as.formula(paste(y_temp2_final,"~",paste(var_xs_final, collapse="+"))),na.action=na.exclude,data=bcov_feat_cov_trn_final) #run regression with x vars and y
+        
+        #apply model to "training" data
+        y1_trn_fit_final <- predict(mod_y1_fit_final,x_temp2_final) #use model to fit train data
+        y1_trn_fit_final <- as.data.frame(y1_trn_fit_final) #convert fitted variable to data frame
+        colnames(y1_trn_fit_final) <- paste(colnames(y_temp2_final),"fit",sep="_") #copy column name and label fitted
+        bcov_feat_trn_fit_final <- cbind(bcov_feat_trn_fit_final,y1_trn_fit_final) #combine fitted y values from each predicted variable
+        
+        #apply model to "testing" data
+        x_temp3_final <- bcov_feat_cov_tst_final[,cov_clmns] #select covariates from testing data
+        y1_tst_fit_final <- predict(mod_y1_fit_final,x_temp3_final) #use model to fit test data
+        y1_tst_fit_final <- as.data.frame(y1_tst_fit_final) #convert fitted variable to data frame
+        colnames(y1_tst_fit_final) <- paste(colnames(y_temp2_final),"fit",sep="_") #copy column name and label fitted (note using the training label!)
+        bcov_feat_tst_fit_final <- cbind(bcov_feat_tst_fit_final,y1_tst_fit_final) #combine fitted y values from each predicted variable
+      }
+      
+      #select relevant columns for analysis of outcome and fitted predictor values
+      bcov_feat_trn_fit_final <- subset(bcov_feat_trn_fit_final, select = feat_clmns[[feat]]) #keep only outcome and fitted values
+      bcov_feat_tst_fit_final <- subset(bcov_feat_tst_fit_final, select = feat_clmns[[feat]]) #keep only outcome and fitted values
+      
+      #make copies of training and testing data to maintain relevant indices/rows
+      bcov_feat_trn_filt_final <- data.frame(1) #designate data frame with first column being 1 for the outcome (make sure outcome is in this location)
+      colnames(bcov_feat_trn_filt_final) <- "cond" #copy column name and label fitted (note using the training label!)
+      bcov_feat_tst_filt_final <- data.frame(1) #designate data frame with first column being 1 for the outcome (make sure outcome is in this location)
+      colnames(bcov_feat_tst_filt_final) <- "cond" #copy column name and label fitted (note using the training label!)
+      
+      #compute data filtering criteria (e.g., t-test)
+      for(kk in 2:length(bcov_feat_trn_fit_final)){
+        x_temp4_final <- subset(bcov_feat_trn_fit_final, select = c(kk)) #select outcome
+        y_temp4_final <- subset(bcov_feat_trn_fit_final, select = c(cond)) #select outcome
+        xy_temp4_final <- cbind(x_temp4_final,y_temp4_final) #bind relevant variables
+        
+        #test association with outcome for filtering
+        ttest1_temp_final <- t.test(xy_temp4_final[,1] ~ xy_temp4_final[,2], data = xy_temp4_final, paired = FALSE, var.equal = FALSE) #compute t-test between outcome groups for predictor
+        x1_trn_filt_final <- ifelse(ttest1_temp_final$p.value < .05, 1, 0) #if t-test p value < .05 indicate 1 for keep, 0 for drop
+        
+        #create row of filter indicators for training data
+        x1_trn_filt_final <- as.data.frame(x1_trn_filt_final) #convert filtered variable to data frame
+        colnames(x1_trn_filt_final) <- paste(colnames(x_temp4_final)) #copy column name and label filt
+        bcov_feat_trn_filt_final <- cbind(bcov_feat_trn_filt_final,x1_trn_filt_final) #combine filtered x values
+        
+        #create row of filter indicators for testing data
+        x_temp5_final <- subset(bcov_feat_tst_fit_final, select = c(kk)) #select data
+        x1_tst_filt_final <- as.data.frame(x1_trn_filt_final) #convert filtered variable to data frame
+        colnames(x1_tst_filt_final) <- paste(colnames(x_temp5_final)) #copy column name and label filt
+        bcov_feat_tst_filt_final <- cbind(bcov_feat_tst_filt_final,x1_tst_filt_final) #combine filtered x values
+      }
+      
+      #select relevant columns for analysis of outcome and filtered predictor values 
+      #bcov_feat_trn_fit_final <- bcov_feat_trn_fit_final[,colSums(bcov_feat_trn_filt_final) == 1] #drop columns that are not 1/above filter threshold
+      #bcov_feat_tst_fit_final <- bcov_feat_tst_fit_final[,colSums(bcov_feat_tst_filt_final) == 1] #drop columns that are not 1/above filter threshold
+      
+      #rescale fitted values within folds before training models
+      preProcValues_final <- preProcess(bcov_feat_trn_fit_final, method = c("center", "scale")) #calculate centering and scaling values for training data
+      bcov_feat_trn_adj_final <- predict(preProcValues_final, bcov_feat_trn_fit_final) #apply centering and scaling adjustment calculated from training data to training data
+      bcov_feat_tst_adj_final <- predict(preProcValues_final, bcov_feat_tst_fit_final) #apply centering and scaling adjustment calculated from training data to testing data
+      
+      #train elastic net
+      def_elenet_final = train(
+        cond ~., 
+        data = bcov_feat_trn_adj_final,
+        method = "glmnet",
+        metric = "ROC",
+        tuneLength = 25,
+        verbose = FALSE,
+        trControl = cv_train_final,
+        tuneGrid = tg
+        )
+      
+      #collect the predicted score based on trained elastic net
+      cond_predicted_final=predict(def_elenet_final,newdata=bcov_feat_tst_adj_final,type = "prob")[,1]
+      cond_predicted_raw_final=predict(def_elenet_final,newdata=bcov_feat_tst_adj_final,type = "raw")
+      
+      #extract fit metrics
+      cond_bestfits_final <- get_best_result(def_elenet_final)
+      
+      #extract coefs
+      cond_coefs_final <- as.data.frame(as.matrix(coef(def_elenet_final$finalModel, s = def_elenet_final$bestTune$lambda)))
+      
+      #extract variable importance
+      cond_varimp_final <- varImp(def_elenet_final, lambda = def_elenet_final$bestTune$lambda, useModel = FALSE, nonpara = TRUE, scale = TRUE)
+      
+      #cond label
+      cond_label_final = bcov_feat$cond
+      
+      #predicted classification combined from outer folds
+      cond_predicted_raw_final <- as.data.frame(cond_predicted_raw_final)
+      cond_predicted_raw_final$cond <- as.factor(cond_predicted_raw_final$cond_predicted_raw_final)
+      
+      #confusion matrix and statistics combined from outer folds
+      cat('\n Confusion matrix and stats from final model for outcome', toString(colnames(rnd_perms)[perm]), 'with seed', toString(as.numeric(rnd_seeds[rsd,1])),'and feature', toString(feat_set_names[feat]),toString(samp), '\n')
+      print(confusionMatrix(cond_predicted_raw_final$cond, bcov_feat$cond))
+      
+      #plot ROC curve and calculate AUC for elastic net
+      roc_object_final <- roc(as.vector(cond_label_final) ~ as.vector(cond_predicted_final), plot = TRUE, print.auc = TRUE, legacy.axes = TRUE, col = "blue3", main = "ROC curve")
+      
+      #feature coefficients
+      print(cond_coefs_final) #print coefficients from the outer folds
+      cond_coefs_sums_final <- as.data.frame(rowSums(cond_coefs_final != 0)) #how many times did features contribute non-zero to outer folds of model fitting
+      print(cond_coefs_sums_final) #how many times did features contribute non-zero to outer folds of model fitting
+      
+      #feature importance
+      print(cond_varimp_final$importance$cond0) #print feature importance from the outer folds
+      
+      #model fit metrics
+      print(cond_bestfits_final) #print model fit metrics across outer folds
+      
+      #calcuate and save final model performance metrics
+      temp_auc_final <- auc(as.vector(cond_label_final) ~ as.vector(cond_predicted_final))
+      temp_sns_final <- sensitivity(cond_predicted_raw_final$cond,cond_label_final)
+      temp_spf_final <- specificity(cond_predicted_raw_final$cond,cond_label_final)
+      temp_acc_final <- Accuracy(as.vector(cond_predicted_raw_final$cond),as.vector(cond_label_final))
+      temp_prc_final <- precision(cond_predicted_raw_final$cond,cond_label_final)
+      temp_rec_final <- recall(cond_predicted_raw_final$cond,cond_label_final)
+      
+      mod_fit_perf_final[1,] <- c(temp_auc_final,temp_sns_final,temp_spf_final,temp_acc_final,temp_prc_final,temp_rec_final)
+      
+      write.csv(mod_fit_perf_final,paste0(datapath1,"mod_fit_perf_final_",toString(colnames(rnd_perms)[perm]),"_s",toString(as.numeric(rnd_seeds[rsd,1])),"_",toString(feat_set_names[feat]),"_",toString(samp),".csv"),row.names = FALSE)
+
+      #save final model
+      saveRDS(def_elenet_final,paste0(datapath1,"model_",toString(colnames(rnd_perms)[perm]),"_s",toString(as.numeric(rnd_seeds[rsd,1])),"_",toString(feat_set_names[feat]),"_",toString(samp),"_final.rds"))
+      
+    }
+  }
+}
+
+```
+
+
+
+
+
+
+
